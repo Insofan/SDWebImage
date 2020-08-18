@@ -22,6 +22,7 @@ static id<SDImageLoader> _defaultImageLoader;
 @property (assign, nonatomic, getter = isCancelled) BOOL cancelled;
 @property (strong, nonatomic, readwrite, nullable) id<SDWebImageOperation> loaderOperation;
 @property (strong, nonatomic, readwrite, nullable) id<SDWebImageOperation> cacheOperation;
+@property (strong, nonatomic, nullable) NSURL *url;
 @property (weak, nonatomic, nullable) SDWebImageManager *manager;
 
 @end
@@ -32,6 +33,8 @@ static id<SDImageLoader> _defaultImageLoader;
 @property (strong, nonatomic, readwrite, nonnull) id<SDImageLoader> imageLoader;
 @property (strong, nonatomic, nonnull) NSMutableSet<NSURL *> *failedURLs;
 @property (strong, nonatomic, nonnull) dispatch_semaphore_t failedURLsLock; // a lock to keep the access to `failedURLs` thread-safe
+@property (nonatomic, strong, nonnull) NSMapTable<NSURL *, SDWebImageCombinedOperation *> *downloadingURLs; // strong-weak map
+@property (strong, nonatomic, nonnull) dispatch_semaphore_t downloadingURLsLock; // a lock to keep the access to `downloadingURLs` thread-safe
 @property (strong, nonatomic, nonnull) NSMutableSet<SDWebImageCombinedOperation *> *runningOperations;
 @property (strong, nonatomic, nonnull) dispatch_semaphore_t runningOperationsLock; // a lock to keep the access to `runningOperations` thread-safe
 
@@ -88,6 +91,8 @@ static id<SDImageLoader> _defaultImageLoader;
         _imageLoader = loader;
         _failedURLs = [NSMutableSet new];
         _failedURLsLock = dispatch_semaphore_create(1);
+        _downloadingURLs= [[NSMapTable alloc] initWithKeyOptions:NSPointerFunctionsStrongMemory valueOptions:NSPointerFunctionsWeakMemory capacity:0];
+        _downloadingURLsLock = dispatch_semaphore_create(1);
         _runningOperations = [NSMutableSet new];
         _runningOperationsLock = dispatch_semaphore_create(1);
     }
@@ -199,10 +204,20 @@ static id<SDImageLoader> _defaultImageLoader;
         [self callCompletionBlockForOperation:operation completion:completedBlock error:[NSError errorWithDomain:SDWebImageErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey : description}] url:url];
         return operation;
     }
-
+    
+    SDWebImageCombinedOperation *exsitOperation = [self.downloadingURLs objectForKey:url];
+    if (exsitOperation) {
+        return exsitOperation;
+    }
+    operation.url = url;
+    
     SD_LOCK(self.runningOperationsLock);
     [self.runningOperations addObject:operation];
     SD_UNLOCK(self.runningOperationsLock);
+    
+    SD_LOCK(self.downloadingURLsLock);
+    [self.downloadingURLs setObject:operation forKey:url];
+    SD_UNLOCK(self.downloadingURLsLock);
     
     // Preprocess the options and context arg to decide the final the result for manager
     SDWebImageOptionsResult *result = [self processedResultForURL:url options:options context:context];
@@ -218,6 +233,10 @@ static id<SDImageLoader> _defaultImageLoader;
     NSSet<SDWebImageCombinedOperation *> *copiedOperations = [self.runningOperations copy];
     SD_UNLOCK(self.runningOperationsLock);
     [copiedOperations makeObjectsPerformSelector:@selector(cancel)]; // This will call `safelyRemoveOperationFromRunning:` and remove from the array
+    
+    SD_LOCK(self.downloadingURLsLock);
+    [self.downloadingURLs removeAllObjects];
+    SD_UNLOCK(self.downloadingURLsLock);
 }
 
 - (BOOL)isRunning {
@@ -563,6 +582,13 @@ static id<SDImageLoader> _defaultImageLoader;
     SD_LOCK(self.runningOperationsLock);
     [self.runningOperations removeObject:operation];
     SD_UNLOCK(self.runningOperationsLock);
+    
+    if (!operation.url) {
+        return;
+    }
+    SD_LOCK(self.downloadingURLsLock);
+    [self.downloadingURLs removeObjectForKey:operation.url];
+    SD_UNLOCK(self.downloadingURLsLock);
 }
 
 - (void)storeImage:(nullable UIImage *)image
